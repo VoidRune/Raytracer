@@ -1,0 +1,481 @@
+#version 450
+
+layout (binding = 0) uniform FrameData {
+    //CAMERA
+    mat4 inverseProjection;
+    mat4 inverseView;
+    vec4 cameraPos;
+    vec4 cameraDir;
+    vec2 window;
+    //SETTINGS
+    uint raysPerPixel;
+    uint maxBouceLimit;
+    //SKY
+    vec4 skyColorHorizon;
+    vec4 skyColorZenith;
+    vec4 sunLightDirection;
+    vec4 groundColor;
+    float sunFocus;
+    float sunIntensity;
+
+    uint frameIndex;
+    uint sphereNumber;
+    uint meshNumber;
+} frameData;
+
+struct Material
+{
+    vec3 color;
+    float light;
+    float smoothness;
+    float pad1;
+    float pad2;
+    float pad3;
+};
+
+struct Sphere
+{
+    vec3 center;
+    float radius;
+    Material material;
+};
+
+struct Torus
+{
+    vec3 center;
+    float centerRadius;
+    float tubeRadius;
+    Material material;
+};
+
+struct Triangle
+{
+    vec4 p1;
+    vec4 p2;
+    vec4 p3;
+
+    vec4 n1;
+    vec4 n2;
+    vec4 n3;
+};
+
+
+struct MeshInfo
+{
+    uint startTriangle;
+    uint numTriangles;
+    float pad1;
+    float pad2;
+    vec4 boundingPoint1;
+    vec4 boundingPoint2;
+    Material material;
+};
+
+layout (std140, binding = 1) buffer InputSpheres {
+   Sphere spheres[ ];
+};
+
+layout (std140, binding = 2) buffer InputTriangles {
+   Triangle triangles[ ];
+};
+
+layout (std140, binding = 3) buffer InputMeshes {
+   MeshInfo meshes[ ];
+};
+
+layout (binding = 4, rgba8) uniform writeonly image2D outputImage;
+layout (binding = 5, rgba32f) uniform image2D accumulationImage;
+
+layout (local_size_x = 64, local_size_y = 16, local_size_z = 1) in;
+
+struct HitInfo
+{
+    bool didHit;
+    vec3 hitPos;
+    vec3 hitNormal;
+    float hitDistance;
+    Material material;
+};
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+};
+
+float RandomValue(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result / 4294967295.0;
+}
+
+vec3 RandomDirection(inout uint rngState)
+{
+    float x = RandomValue(rngState) * 2.0 - 1.0;
+    float y = RandomValue(rngState) * 2.0 - 1.0;
+    float z = RandomValue(rngState) * 2.0 - 1.0;
+
+    return vec3(x, y, z);
+}
+
+vec2 RandomPointInCircle(inout uint rngState)
+{
+    float angle = RandomValue(rngState) * 2.0 * 3.14159265;
+    vec2 pointInCircle = vec2(cos(angle), sin(angle));
+    return pointInCircle * sqrt(RandomValue(rngState));
+}
+
+HitInfo RaySphere(Ray ray, Sphere sphere)
+{
+    HitInfo info;
+    info.didHit = false;
+
+    vec3 sphereCenter = sphere.center;
+    float radius = sphere.radius;
+    vec3 offsetRayOrigin = ray.origin - sphereCenter;
+
+    float a = dot(ray.direction, ray.direction);
+    float b = 2.0 * dot(offsetRayOrigin, ray.direction);
+    float c = dot(offsetRayOrigin, offsetRayOrigin) - radius * radius;
+
+    float discriminant = b * b - 4.0 * a * c;
+
+    if(discriminant >= 0.0)
+    {
+        float dst = (-b - sqrt(discriminant)) / (2.0 * a);
+        if(dst > 0.0001)
+        {
+            vec3 hit = ray.origin + ray.direction * dst;
+            vec3 normal = normalize(hit - sphereCenter);
+            info.didHit = true;
+            info.hitPos = hit;
+            info.hitNormal = normal;
+            info.hitDistance = dst;
+            info.material = sphere.material;
+        }
+    }
+
+    return info;
+}
+
+float cbrt(in float x) { return sign(x) * pow(abs(x), 1.0 / 3.0); }
+int solveQuartic(in float a, in float b, in float c, in float d, in float e, inout vec4 roots) {
+    b /= a; c /= a; d /= a; e /= a; // Divide by leading coefficient to make it 1
+
+    // Depress the quartic to x^4 + px^2 + qx + r by substituting x-b/4a
+    // This can be found by substituting x+u and the solving for the value
+    // of u that makes the t^3 term go away
+    float bb = b * b;
+    float p = (8.0 * c - 3.0 * bb) / 8.0;
+    float q = (8.0 * d - 4.0 * c * b + bb * b) / 8.0;
+    float r = (256.0 * e - 64.0 * d * b + 16.0 * c * bb - 3.0 * bb * bb) / 256.0;
+    int n = 0; // Root counter
+
+    // Solve for a root to (t^2)^3 + 2p(t^2)^2 + (p^2 - 4r)(t^2) - q^2 which resolves the
+    // system of equations relating the product of two quadratics to the depressed quartic
+    float ra =  2.0 * p;
+    float rb =  p * p - 4.0 * r;
+    float rc = -q * q;
+
+    // Depress using the method above
+    float ru = ra / 3.0;
+    float rp = rb - ra * ru;
+    float rq = rc - (rb - 2.0 * ra * ra / 9.0) * ru;
+
+    float lambda;
+    float rh = 0.25 * rq * rq + rp * rp * rp / 27.0;
+    if (rh > 0.0) { // Use Cardano's formula in the case of one real root
+        rh = sqrt(rh);
+        float ro = -0.5 * rq;
+        lambda = cbrt(ro - rh) + cbrt(ro + rh) - ru;
+    }
+
+    else { // Use complex arithmetic in the case of three real roots
+        float rm = sqrt(-rp / 3.0);
+        lambda = -2.0 * rm * sin(asin(1.5 * rq / (rp * rm)) / 3.0) - ru;
+    }
+
+    // Newton iteration to fix numerical problems (using Horners method)
+    // Suggested by @NinjaKoala
+    for(int i=0; i < 2; i++) {
+        float a_2 = ra + lambda;
+        float a_1 = rb + lambda * a_2;
+        float b_2 = a_2 + lambda;
+
+        float f = rc + lambda * a_1; // Evaluation of lambda^3 + ra * lambda^2 + rb * lambda + rc
+        float f1 = a_1 + lambda * b_2; // Derivative
+
+        lambda -= f / f1; // Newton iteration step
+    }
+
+    // Solve two quadratics factored from the quartic using the cubic root
+    if (lambda < 0.0) return n;
+    float t = sqrt(lambda); // Because we solved for t^2 but want t
+    float alpha = 2.0 * q / t, beta = lambda + ra;
+
+    float u = 0.25 * b;
+    t *= 0.5;
+
+    float z = -alpha - beta;
+    if (z > 0.0) {
+        z = sqrt(z) * 0.5;
+        float h = +t - u;
+        roots.xy = vec2(h + z, h - z);
+        n += 2;
+    }
+
+    float w = +alpha - beta;
+    if (w > 0.0) {
+        w = sqrt(w) * 0.5;
+        float h = -t - u;
+        roots.zw = vec2(h + w, h - w);
+        if (n == 0) roots.xy = roots.zw;
+        n += 2;
+    }
+
+    return n;
+}
+
+
+HitInfo RayTorus(Ray ray, Torus tor)
+{
+    HitInfo info;
+    info.didHit = false;
+
+    float R = tor.centerRadius;
+    float S = tor.tubeRadius;
+    float T = 4.0 * R * R;
+    float G = T * (ray.direction.x*ray.direction.x + ray.direction.y*ray.direction.y);
+    float H = 2.0 * T * (ray.origin.x*ray.direction.x + ray.origin.y*ray.direction.y);
+    float I = T * (ray.origin.x*ray.origin.x + ray.origin.y*ray.origin.y);
+    float J = dot(ray.direction, ray.direction);
+    float K = 2.0 * dot(ray.origin, ray.direction);
+    float L = dot(ray.origin, ray.origin) + R*R - S*S;
+
+    float a = J*J;
+    float b = 2.0*J*K;
+    float c = 2.0*J*L + K*K - G;
+    float d = 2.0*K*L - H;
+    float e = L*L - I;
+
+    vec4 roots;
+    int numRoots = solveQuartic(a, b, c, d, e, roots);
+
+    float dst = 3.402823466e+38;
+    for(int i = 0; i < numRoots; i++)
+    {
+        if(roots[i] > 0.0001 && roots[i] < dst)
+        {
+            info.didHit = true;
+            dst = roots[i];
+        }
+    }
+
+    vec3 hitPos = ray.origin + ray.direction * dst;
+    float h = 1.0 - (tor.centerRadius / sqrt(hitPos.x * hitPos.x + hitPos.y * hitPos.y));
+
+    info.hitPos = hitPos;
+    info.hitNormal = normalize(vec3(h * hitPos.x, h * hitPos.y, hitPos.z));
+    info.hitDistance = dst;
+    
+    return info;
+}
+
+HitInfo RayTriangle(Ray ray, Triangle tri)
+{
+    vec3 edgeAB = tri.p2.xyz - tri.p1.xyz;
+    vec3 edgeAC = tri.p3.xyz - tri.p1.xyz;
+    vec3 normal = cross(edgeAB, edgeAC);
+    vec3 ao = ray.origin - tri.p1.xyz;
+    vec3 dao = cross(ao, ray.direction);
+
+    float determinant = -dot(ray.direction, normal);
+    float invDet = 1 / determinant;
+
+    float dst = dot(ao, normal) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    HitInfo info;
+    info.didHit = determinant >= 1e-6 && dst >= 0 && u >= 0 && v >= 0 && w >= 0;
+    info.hitPos = ray.origin + ray.direction * dst;
+    info.hitNormal = normalize(tri.n1.xyz * w + tri.n2.xyz * u + tri.n3.xyz * v);
+    info.hitDistance = dst;
+    
+    return info;
+}
+
+bool RayBox(Ray ray, vec3 p1, vec3 p2)
+{
+    vec3 dirFrac = 1 / ray.direction;
+
+    float t1 = (p1.x - ray.origin.x) * dirFrac.x;
+    float t2 = (p2.x - ray.origin.x) * dirFrac.x;
+    float t3 = (p1.y - ray.origin.y) * dirFrac.y;
+    float t4 = (p2.y - ray.origin.y) * dirFrac.y;
+    float t5 = (p1.z - ray.origin.z) * dirFrac.z;
+    float t6 = (p2.z - ray.origin.z) * dirFrac.z;
+    
+    float tmin = max(max(min(t1, t2), min(t3, t4)), min(t5, t6));
+    float tmax = min(min(max(t1, t2), max(t3, t4)), max(t5, t6));
+    
+    if (tmax < 0)
+    {
+        return false;
+    }
+    
+    if (tmin > tmax)
+    {
+        return false;
+    }
+    
+    return true;
+}
+
+HitInfo ClosestHit(Ray ray)
+{
+    HitInfo info;
+    info.didHit = false;
+    info.hitDistance = 3.402823466e+38;
+    for(int i = 0; i < frameData.sphereNumber; i++)
+    {
+        HitInfo temp = RaySphere(ray, spheres[i]);
+        if(temp.didHit && temp.hitDistance < info.hitDistance)
+        {
+            info = temp;
+        }
+    }
+
+    for(int i = 0; i < frameData.meshNumber; i++)
+    {
+        MeshInfo mesh = meshes[i];
+        if(RayBox(ray, mesh.boundingPoint1.xyz, mesh.boundingPoint2.xyz))
+        {
+            for(uint j = mesh.startTriangle; j < mesh.startTriangle + mesh.numTriangles; j++)
+            {
+                Triangle t = triangles[j];
+                HitInfo temp = RayTriangle(ray, t);
+                if(temp.didHit && temp.hitDistance < info.hitDistance)
+                {
+                    info = temp;
+                    info.material = mesh.material;
+                }
+            }
+        }
+    }
+
+    /*
+    Torus t;
+    t.center = vec3(0, 0, 0);
+    t.centerRadius = 0.5;
+    t.tubeRadius = 0.25;
+    t.material.color = vec3(0.2, 0.8, 0.4);
+    t.material.light = 0;
+    t.material.smoothness = 0.5;
+
+    HitInfo temp = RayTorus(ray, t);
+
+    if(temp.didHit && temp.hitDistance < info.hitDistance)
+    {
+        info = temp;
+        info.material = t.material;
+    }*/
+
+    return info;
+}
+
+vec3 GetEnvironmentLight(Ray ray)
+{
+    vec3 SkyColorHorizon = frameData.skyColorHorizon.xyz;
+    vec3 SkyColorZenith = frameData.skyColorZenith.xyz;
+    vec3 SunLightDirection = frameData.sunLightDirection.xzy;
+    vec3 GroundColor = frameData.groundColor.xyz;
+    float SunFocus = frameData.sunFocus;
+    float SunIntensity = frameData.sunIntensity;
+
+    float skyGradientT = pow(smoothstep(0.0, 0.4, ray.direction.y), 0.35);
+    vec3 skyGradient = mix(SkyColorHorizon, SkyColorZenith, skyGradientT);
+    float sun = pow(max(0, dot(ray.direction, -SunLightDirection)), SunFocus) * SunIntensity;
+
+    float groundToSkyT = smoothstep(-0.01, 0.0, ray.direction.y);
+    float sunMask = float(groundToSkyT >= 1);
+    return mix(GroundColor, skyGradient, groundToSkyT) + sun * sunMask;
+}
+
+vec3 Trace(Ray ray, inout uint rngState)
+{
+    vec3 incomingLight = vec3(0, 0, 0);
+    vec3 rayColor = vec3(1, 1, 1);
+
+    for(int i = 0; i < frameData.maxBouceLimit; i++)
+    {
+        HitInfo info = ClosestHit(ray);
+
+        if(info.didHit)
+        {
+            vec3 diffuseDir = normalize(info.hitNormal + RandomDirection(rngState));
+            vec3 specularDir = reflect(ray.direction, info.hitNormal);
+            Material mat = info.material;
+
+            ray.origin = info.hitPos;
+            ray.direction = mix(diffuseDir, specularDir, mat.smoothness);
+
+            vec3 emissionColor = vec3(1, 1, 1);
+            vec3 emittedLight = emissionColor * mat.light;
+            incomingLight += emittedLight * rayColor;
+            rayColor *= mat.color.rgb;
+
+        }
+        else
+        {
+            incomingLight += GetEnvironmentLight(ray) * rayColor;
+            break;
+        }
+    }
+    return incomingLight;
+}
+
+void main() 
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;  
+
+    float width = float(frameData.window.x);
+    float height = float(frameData.window.y);
+
+    vec2 coord = vec2(x / width, y / height) * 2.0 - 1.0;
+
+    vec3 rayOrigin = frameData.cameraPos.xyz;
+    vec4 rayTarget = frameData.inverseProjection * vec4(coord, 1.0, 1.0);
+    vec3 rayDirection = vec3(frameData.inverseView * vec4(normalize(rayTarget.xyz / rayTarget.w), 0.0));
+
+
+    Ray ray;
+    ray.origin = rayOrigin;
+    ray.direction = rayDirection;
+
+    vec3 incomingLight = vec3(0, 0, 0);
+
+    uint rngState = uint(x + width * y) + frameData.frameIndex * 719393;
+
+    for(int k = 0; k < frameData.raysPerPixel; k++)
+    {
+        rngState += k;
+        incomingLight += Trace(ray, rngState);
+    }
+
+    incomingLight = incomingLight / frameData.raysPerPixel;
+    vec4 accumulated = imageLoad(accumulationImage, ivec2(x, y));
+    vec4 write = vec4(accumulated.xyz + incomingLight, 1);
+    if(frameData.frameIndex == 1)
+    {
+        accumulated = vec4(incomingLight, 1);
+        write = vec4(incomingLight, 1);
+    }
+
+    imageStore(accumulationImage, ivec2(x, y), write);
+    imageStore(outputImage, ivec2(x, y), vec4(write.xyz / frameData.frameIndex, 1));
+}
